@@ -1,0 +1,7 @@
+[
+    {
+        "email": "your_email@gmail.com",
+        "access_token": "paste_your_access_token_here",
+        "refresh_token": "paste_your_refresh_token_here"
+    }
+]
