@@ -193,6 +193,7 @@ const DEFAULT_CONFIG = {
     trade: {
         enabled: true, symbols: ["BTCUSDT"], leverage: 1,
         margin_mode: "isolated", margin_source: "oil", margin_pct: 100,
+        fixed_margin: 10, max_margin_per_order: 100,
         tp_pct: 5.0, sl_pct: 2.0, max_open_positions: 1, dry_run: false,
         daily_trades: 3, cycle_gap_minutes: 480,
         auto_close_enabled: true, auto_close_after_hours: 8,
@@ -575,8 +576,14 @@ class KieDexBot {
             this.logger.ok(`${EMOJI.refresh} Token refreshed`);
             return true;
         } catch (e) {
-            this.logger.error(`${EMOJI.cross} Refresh failed: ${e.message}`);
-            this.webhook.send("refresh_failed", `${email}: ${e.message}`);
+            const msg = String(e.message || "").toLowerCase();
+            if (msg.includes("already_used") || msg.includes("already used")) {
+                this.logger.critical(`${EMOJI.cross} Refresh token already used — re-login to KieDex and update accounts.json`);
+                this.webhook.send("refresh_failed", `${email}: refresh_token_already_used`);
+            } else {
+                this.logger.error(`${EMOJI.cross} Refresh failed: ${e.message}`);
+                this.webhook.send("refresh_failed", `${email}: ${e.message}`);
+            }
             return false;
         }
     }
@@ -931,10 +938,17 @@ class KieDexBot {
         const btc = await this.getPrice(symbol, agent);
         if (!btc) { report.trade_skipped_reason = "no-price"; return; }
 
-        const rawMargin = this.cfg.trade.margin_source === "oil"
-            ? oil * (this.cfg.trade.margin_pct / 100)
-            : Math.min(usdt, oil) * (this.cfg.trade.margin_pct / 100);
-        let margin = Math.floor(rawMargin * 100) / 100;
+        const fixedMargin = Number(this.cfg.trade.fixed_margin || 0);
+        let margin;
+        if (fixedMargin > 0) {
+            margin = fixedMargin;
+            this.logger.info(`${EMOJI.dot} Using fixed margin: ${margin}`);
+        } else {
+            const rawMargin = this.cfg.trade.margin_source === "oil"
+                ? oil * (this.cfg.trade.margin_pct / 100)
+                : Math.min(usdt, oil) * (this.cfg.trade.margin_pct / 100);
+            margin = Math.floor(rawMargin * 100) / 100;
+        }
         if (margin < this.cfg.risk.min_usdt) { report.trade_skipped_reason = "low-margin"; return; }
 
         const oilFeeNeeded = margin * this.cfg.trade.leverage * OIL_FEE_MULTIPLIER;
@@ -946,6 +960,12 @@ class KieDexBot {
             }
             this.logger.warn(`${EMOJI.warn} Auto-shrink margin: ${margin} → ${maxMargin}`);
             margin = maxMargin;
+        }
+
+        const cap = Number(this.cfg.trade.max_margin_per_order || 0);
+        if (cap > 0 && margin > cap) {
+            this.logger.warn(`${EMOJI.warn} Capping margin ${margin} → ${cap}`);
+            margin = cap;
         }
 
         const tp = +(btc * (1 + this.cfg.trade.tp_pct / 100)).toFixed(2);
