@@ -148,15 +148,31 @@ const API_KEY  = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsI
 const ORIGIN   = "https://www.kiedex.app";
 const REFERER  = "https://www.kiedex.app/";
 
-const FILE_ACCOUNTS  = "accounts.json";
-const FILE_PROXIES   = "proxy.txt";
-const FILE_CONFIG    = "config.json";
-const FILE_APROXIES  = "account_proxies.json";
-const FILE_QUIZ_LOG  = "quiz_log.json";
-const DIR_LOGS       = "logs";
+const FILE_ACCOUNTS      = "accounts.json";
+const FILE_PROXIES       = "proxy.txt";
+const FILE_CONFIG        = "config.json";
+const FILE_APROXIES      = "account_proxies.json";
+const FILE_QUIZ_LOG      = "quiz_log.json";
+const FILE_LEVERAGE_CACHE = "leverage_cache.json";
+const DIR_LOGS           = "logs";
 
 const TOKEN_REFRESH_MARGIN_SEC = 300;
-const OIL_FEE_MULTIPLIER       = 1.5;
+const OIL_FEE_MULTIPLIER       = 0.05;
+
+// ─────────────────────────────────────────────────────────────
+// All KieDex pairs (from your screenshots)
+// ─────────────────────────────────────────────────────────────
+const KIEDEX_SYMBOLS = [
+    "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT",
+    "ADAUSDT", "DOGEUSDT", "TRXUSDT", "MATICUSDT", "DOTUSDT",
+    "LTCUSDT", "AVAXUSDT", "ATOMUSDT", "LINKUSDT", "SUIUSDT",
+    "SHIBUSDT", "PEPEUSDT", "ZECUSDT"
+];
+
+// Symbols to never trade even if returned by the API
+const SYMBOL_BLACKLIST = new Set([
+    "USDCUSDT", "BUSDUSDT", "TUSDUSDT", "FDUSDUSDT", "DAIUSDT", "USDTUSDT"
+]);
 
 const USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
@@ -191,22 +207,35 @@ const DEFAULT_CONFIG = {
         quiz_log_path: FILE_QUIZ_LOG
     },
     trade: {
-        enabled: true, symbols: ["BTCUSDT"], leverage: 1,
-        margin_mode: "isolated", margin_source: "oil", margin_pct: 100,
-        fixed_margin: 10, max_margin_per_order: 100,
-        tp_pct: 5.0, sl_pct: 2.0, max_open_positions: 1, dry_run: false,
-        daily_trades: 3, cycle_gap_minutes: 480,
-        auto_close_enabled: true, auto_close_after_hours: 8,
-        auto_close_on_profit_pct: 2.0, auto_close_on_loss_pct: 3.0,
-        close_before_reopen: true, close_timeout_ms: 25000,
-        close_reason_tag: "bot_auto_close",
+        enabled: true,
+        symbols: "all",
+        leverage: 50,
+        margin_mode: "isolated",
+        margin_source: "oil",
+        margin_pct: 100,
+        fixed_margin: 20,
+        max_margin_per_order: 40,
+        tp_pct: 5.0,
+        sl_pct: 40.0,
+        max_open_positions: 10,
+        max_trades_per_cycle: 3,
+        dry_run: false,
+        daily_trades: 24,
+        cycle_gap_minutes: 5,
+        auto_close_enabled: true,
+        auto_close_after_hours: 0,
+        auto_close_on_profit_pct: 20.0,
+        auto_close_on_loss_pct: 40.0,
+        close_before_reopen: false,
+        close_timeout_ms: 25000,
+        close_reason_tag: "volume_farm",
         daily_kdx_use_yesterday: true
     },
     risk: {
-        min_oil: 5, min_usdt: 5,
-        auto_exchange_eth_to_oil: true, min_oil_trigger_exchange: 10,
+        min_oil: 20, min_usdt: 20,
+        auto_exchange_eth_to_oil: true, min_oil_trigger_exchange: 40,
         min_eth_to_exchange: 0.0005,
-        auto_transfer_spot_to_futures: true, min_futures_usdt: 5
+        auto_transfer_spot_to_futures: true, min_futures_usdt: 20
     },
     proxy: {
         preflight_check: true, sticky_per_account: true,
@@ -488,7 +517,11 @@ class KieDexBot {
         this.shutdown = false;
         this.useProxy = options.useProxy !== false;
 
+        // Per-symbol max leverage cache (persisted to leverage_cache.json)
+        this._maxLeverageCache = new Map();
+
         this.report = this._newReport();
+        this._loadLeverageCache();
 
         process.on("SIGINT", () => {
             if (this.shutdown) process.exit(1);
@@ -508,6 +541,48 @@ class KieDexBot {
             quizzes_submitted: 0,
             total_kdx_earned: 0, per_account: []
         };
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // Leverage cache (persisted)
+    // ─────────────────────────────────────────────────────────
+    _loadLeverageCache() {
+        const data = loadJSON(FILE_LEVERAGE_CACHE, {});
+        for (const [sym, lev] of Object.entries(data || {})) {
+            const n = Number(lev);
+            if (Number.isFinite(n) && n > 0) this._maxLeverageCache.set(sym, n);
+        }
+        if (this._maxLeverageCache.size) {
+            const entries = Array.from(this._maxLeverageCache.entries())
+                .map(([s, l]) => `${s}=${l}x`).join(", ");
+            this.logger.info(`${EMOJI.shield} Loaded leverage caps: ${entries}`);
+        }
+    }
+    _saveLeverageCache() {
+        const obj = {};
+        for (const [sym, lev] of this._maxLeverageCache.entries()) obj[sym] = lev;
+        try { saveJSONAtomic(FILE_LEVERAGE_CACHE, obj); } catch (e) {
+            this.logger.debug(`leverage_cache save failed: ${e.message}`);
+        }
+    }
+    _parseMaxLeverageFromError(err) {
+        const m = String(err || "").match(/maximum\s+leverage\s+is\s+(\d+)\s*x/i);
+        return m ? Number(m[1]) : null;
+    }
+    _rememberMaxLeverage(symbol, maxLev) {
+        if (!Number.isFinite(maxLev) || maxLev <= 0) return;
+        const prev = this._maxLeverageCache.get(symbol);
+        if (prev !== maxLev) {
+            this._maxLeverageCache.set(symbol, maxLev);
+            this.logger.ok(`${EMOJI.shield} ${symbol}: max leverage ${maxLev}x cached`);
+            this._saveLeverageCache();
+        }
+    }
+    // Best leverage to use for this symbol: cached cap, else config default
+    _leverageFor(symbol) {
+        const cap = this._maxLeverageCache.get(symbol);
+        if (cap) return Math.min(cap, this.cfg.trade.leverage);
+        return this.cfg.trade.leverage;
     }
 
     baseHeaders() {
@@ -588,7 +663,19 @@ class KieDexBot {
         }
     }
 
-    loadAccounts() { const raw = loadJSON(FILE_ACCOUNTS, []); return Array.isArray(raw) ? raw : []; }
+    loadAccounts() {
+        const raw = loadJSON(FILE_ACCOUNTS, []);
+        if (!Array.isArray(raw)) {
+            this.logger.error(`${EMOJI.cross} accounts.json is not an array — fix the file (needs leading "[")`);
+            return [];
+        }
+        for (const a of raw) {
+            if (!a?.email || !a?.access_token || !a?.refresh_token) {
+                this.logger.warn(`${EMOJI.warn} Skipping malformed account entry: ${JSON.stringify(a).slice(0, 80)}`);
+            }
+        }
+        return raw;
+    }
     saveAccounts() {
         const arr = Array.from(this.accounts.entries()).map(([email, v]) => ({
             email, access_token: v.access_token, refresh_token: v.refresh_token
@@ -677,6 +764,43 @@ class KieDexBot {
         } catch { return null; }
     }
 
+    // ─────────────────────────────────────────────────────────
+    // Symbol discovery: try platform DB, merge with hardcoded list
+    // ─────────────────────────────────────────────────────────
+    async getTradableSymbols(email, agent) {
+        const cfgSyms = this.cfg.trade?.symbols;
+
+        if (Array.isArray(cfgSyms) && cfgSyms.length > 0) {
+            const cleaned = cfgSyms
+                .map(s => String(s).toUpperCase())
+                .map(s => s.endsWith("USDT") ? s : `${s}USDT`)
+                .filter(s => !SYMBOL_BLACKLIST.has(s));
+            if (cleaned.length) return cleaned;
+        }
+
+        const discovered = new Set();
+
+        for (const table of ["markets", "trading_pairs", "symbols", "pairs"]) {
+            const rows = await this.apiGet(email, table, { select: "*", limit: "200" }, agent);
+            if (Array.isArray(rows) && rows.length) {
+                for (const r of rows) {
+                    const sym = r.symbol || r.name || r.pair || r.ticker;
+                    if (sym && typeof sym === "string") {
+                        const s = sym.toUpperCase().replace("/", "").replace("-", "");
+                        if (s.endsWith("USDT") && !SYMBOL_BLACKLIST.has(s)) discovered.add(s);
+                    }
+                }
+                if (discovered.size > 0) break;
+            }
+        }
+
+        for (const s of KIEDEX_SYMBOLS) {
+            if (!SYMBOL_BLACKLIST.has(s)) discovered.add(s);
+        }
+
+        return Array.from(discovered);
+    }
+
     async claimFaucet(email, agent) { return this.apiRpc(email, "claim_daily_faucet", {}, agent); }
     async claimOil(email, agent)    { return this.apiRpc(email, "claim_daily_oil", {}, agent); }
     async claimDailyKdx(email, agent, dateStr) {
@@ -738,12 +862,15 @@ class KieDexBot {
     async _closeStalePositions(email, agent, report) {
         const cfg = this.cfg.trade || {};
         if (!cfg.auto_close_enabled) return;
+
         const positions = await this.getMyOpenPositions(email, agent);
         if (!Array.isArray(positions) || positions.length === 0) {
             this.logger.debug("Close-check: no open positions");
             return;
         }
+
         this.logger.info(`${EMOJI.chart} Close-check: ${positions.length} open position(s)`);
+
         for (const pos of positions) {
             const margin   = Number(pos.margin || 0);
             const leverage = Number(pos.leverage || 1);
@@ -752,26 +879,47 @@ class KieDexBot {
             const openedAt = pos.opened_at ? new Date(pos.opened_at).getTime() : Date.now();
             const ageHours = (Date.now() - openedAt) / 3_600_000;
             if (!margin || !entry) continue;
+
             const current = await this.getPrice(pos.symbol, agent);
             if (!current) continue;
+
             const { pnl, pnlPct } = this.computePnl(entry, current, side, margin, leverage);
+
             this.logger.info(
                 `${EMOJI.dot} ${pos.symbol} ${side.toUpperCase()} · entry ${entry} → now ${current} · ` +
-                `PnL ${pnl.toFixed(2)} (${pnlPct.toFixed(2)}%) · age ${ageHours.toFixed(2)}h`
+                `PnL ${pnl.toFixed(2)} (${pnlPct.toFixed(2)}%) · lev ${leverage}x · age ${ageHours.toFixed(2)}h`
             );
+
             let reason = null;
-            if (cfg.close_before_reopen) reason = "close-before-reopen";
-            else if (cfg.auto_close_on_profit_pct > 0 && pnlPct >= cfg.auto_close_on_profit_pct) reason = `profit +${pnlPct.toFixed(2)}%`;
-            else if (cfg.auto_close_on_loss_pct > 0 && pnlPct <= -Math.abs(cfg.auto_close_on_loss_pct)) reason = `loss ${pnlPct.toFixed(2)}%`;
-            else if (cfg.auto_close_after_hours > 0 && ageHours >= cfg.auto_close_after_hours) reason = `max-age ${ageHours.toFixed(2)}h`;
-            if (!reason) continue;
+
+            if (cfg.auto_close_on_profit_pct > 0 && pnlPct >= cfg.auto_close_on_profit_pct) {
+                reason = `profit +${pnlPct.toFixed(2)}% (target +${cfg.auto_close_on_profit_pct}%)`;
+            } else if (cfg.auto_close_on_loss_pct > 0 && pnlPct <= -Math.abs(cfg.auto_close_on_loss_pct)) {
+                reason = `loss ${pnlPct.toFixed(2)}% (limit -${cfg.auto_close_on_loss_pct}%)`;
+            } else if (cfg.auto_close_after_hours > 0 && ageHours >= cfg.auto_close_after_hours) {
+                reason = `max-age ${ageHours.toFixed(2)}h`;
+            }
+
+            if (!reason) {
+                this.logger.info(
+                    `${EMOJI.check} Holding ${pos.symbol} — PnL ${pnlPct.toFixed(2)}% ` +
+                    `(need +${cfg.auto_close_on_profit_pct}% or -${cfg.auto_close_on_loss_pct}%)`
+                );
+                continue;
+            }
+
             this.logger.warn(`${EMOJI.bolt} Closing ${pos.symbol} — ${reason}`);
             const res = await this.closePosition(email, pos, current, agent);
+
             if (res.ok) {
                 const realizedPnl = Number(res.pnl ?? pnl);
-                this.logger.ok(`${EMOJI.party} Closed ${pos.symbol} @ ${current} — ${reason} · PnL ${realizedPnl.toFixed(2)}`);
+                this.logger.ok(
+                    `${EMOJI.party} Closed ${pos.symbol} @ ${current} — ${reason} · PnL ${realizedPnl.toFixed(2)}`
+                );
                 report.positions_closed = (report.positions_closed || 0) + 1;
                 report.realized_pnl = (report.realized_pnl || 0) + realizedPnl;
+                this.webhook.send("close_trade",
+                    `${email} ${pos.symbol} ${side} closed ${reason} · PnL ${realizedPnl.toFixed(2)}`);
             } else {
                 this.logger.error(`${EMOJI.cross} Close failed: ${res.error}`);
                 report.close_errors = (report.close_errors || 0) + 1;
@@ -907,85 +1055,190 @@ class KieDexBot {
         }
     }
 
+    // ─────────────────────────────────────────────────────────
+    // Single open attempt. Returns true on success.
+    // ─────────────────────────────────────────────────────────
+    async _attemptOpen({ email, agent, symbol, price, margin, leverage, onOilUsed, report }) {
+        const cfg = this.cfg.trade;
+
+        const tp = +(price * (1 + cfg.tp_pct / 100)).toFixed(8);
+        const sl = +(price * (1 - cfg.sl_pct / 100)).toFixed(8);
+        const oilFeeFinal = (margin * leverage * OIL_FEE_MULTIPLIER).toFixed(2);
+
+        this.logger.info(
+            `${EMOJI.chart} Trade: ${symbol} Long @ ${price} · margin ${margin} · lev ${leverage}x · ` +
+            `fee ${oilFeeFinal} OIL · TP ${tp} · SL ${sl}`
+        );
+
+        const res = await this.executeTradeRpc(email, {
+            symbol, side: "long", leverage,
+            margin, entry_price: price, take_profit: tp, stop_loss: sl,
+            margin_mode: cfg.margin_mode
+        }, agent);
+
+        if (res?.success) {
+            this.logger.ok(`${EMOJI.party} Trade opened on ${symbol} @ ${leverage}x`);
+            report.trade_opened = true;
+            report.trades_opened = (report.trades_opened || 0) + 1;
+            onOilUsed(margin * leverage * OIL_FEE_MULTIPLIER);
+            report.__lastOpenError = "";
+            return true;
+        }
+
+        const err = res?.error || res?.__rpc_error || JSON.stringify(res).slice(0, 200);
+        this.logger.warn(`${EMOJI.warn} ${symbol}: open rejected — ${err}`);
+        report.__lastOpenError = err;
+        report.trade_skipped_reason = `trade-failed:${symbol}`;
+        return false;
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // Multi-pair trade runner. Uses cached max leverage per symbol.
+    // ─────────────────────────────────────────────────────────
     async _runTrade(email, agent, report) {
-        const symbol = this.cfg.trade.symbols[0] || "BTCUSDT";
+        const cfg = this.cfg.trade;
+
         await this._closeStalePositions(email, agent, report);
 
         const open = await this.getMyOpenPositions(email, agent);
-        const openOnSymbol = (open || []).filter(p => p.symbol === symbol);
-        if (openOnSymbol.length >= this.cfg.trade.max_open_positions) {
-            this.logger.warn(`${EMOJI.warn} Trade skipped — max open`);
+        const openSymbols = new Set((open || []).map(p => p.symbol));
+        if (openSymbols.size >= cfg.max_open_positions) {
+            this.logger.warn(
+                `${EMOJI.warn} Trade skipped — max open positions reached (${openSymbols.size}/${cfg.max_open_positions})`
+            );
             report.trade_skipped_reason = "max-open";
             return;
         }
-        const pending = await this.getLimitOrders(email, agent);
-        if (Array.isArray(pending) && pending.some(o => o.symbol === symbol)) {
-            this.logger.warn(`${EMOJI.warn} Trade skipped — pending limit`);
-            report.trade_skipped_reason = "pending-limit";
+
+        const allSymbols = await this.getTradableSymbols(email, agent);
+        if (!allSymbols.length) {
+            this.logger.warn(`${EMOJI.warn} No tradable symbols discovered`);
+            report.trade_skipped_reason = "no-symbols";
             return;
         }
+
+        const pending = await this.getLimitOrders(email, agent);
+        const pendingSymbols = new Set(
+            Array.isArray(pending) ? pending.map(o => o.symbol) : []
+        );
+
+        const available = allSymbols.filter(s => !openSymbols.has(s) && !pendingSymbols.has(s));
+        if (!available.length) {
+            this.logger.info(`${EMOJI.check} No fresh symbols to open this cycle (all open or pending)`);
+            report.trade_skipped_reason = "all-symbols-open";
+            return;
+        }
+
+        const slotsLeft = cfg.max_open_positions - openSymbols.size;
+        const perCycle = Math.min(cfg.max_trades_per_cycle || 1, slotsLeft, available.length);
+
+        this.logger.info(
+            `${EMOJI.chart} Opening up to ${perCycle} new position(s) · ` +
+            `${openSymbols.size}/${cfg.max_open_positions} slots used · ` +
+            `${available.length} symbols available`
+        );
+
+        const picks = available.slice().sort(() => Math.random() - 0.5).slice(0, perCycle);
+
         const bal = await this.getBalances(email, agent);
         if (!bal) { report.trade_skipped_reason = "no-balances"; return; }
 
         const usdt = Number(bal.demo_usdt_balance || 0);
         const oilBalance = Number(bal.oil_balance || 0);
         const oilLocked  = Number(bal.oil_locked || 0);
-        const oil = Math.max(0, oilBalance - oilLocked);
+        let oil = Math.max(0, oilBalance - oilLocked);
 
-        if (usdt < this.cfg.risk.min_usdt) { report.trade_skipped_reason = "low-usdt"; return; }
-        if (oil < this.cfg.risk.min_oil) { report.trade_skipped_reason = "low-oil"; return; }
-
-        const btc = await this.getPrice(symbol, agent);
-        if (!btc) { report.trade_skipped_reason = "no-price"; return; }
-
-        const fixedMargin = Number(this.cfg.trade.fixed_margin || 0);
-        let margin;
-        if (fixedMargin > 0) {
-            margin = fixedMargin;
-            this.logger.info(`${EMOJI.dot} Using fixed margin: ${margin}`);
-        } else {
-            const rawMargin = this.cfg.trade.margin_source === "oil"
-                ? oil * (this.cfg.trade.margin_pct / 100)
-                : Math.min(usdt, oil) * (this.cfg.trade.margin_pct / 100);
-            margin = Math.floor(rawMargin * 100) / 100;
+        if (usdt < this.cfg.risk.min_usdt) {
+            report.trade_skipped_reason = "low-usdt";
+            return;
         }
-        if (margin < this.cfg.risk.min_usdt) { report.trade_skipped_reason = "low-margin"; return; }
+        if (oil < this.cfg.risk.min_oil) {
+            report.trade_skipped_reason = "low-oil";
+            return;
+        }
 
-        const oilFeeNeeded = margin * this.cfg.trade.leverage * OIL_FEE_MULTIPLIER;
-        if (oilFeeNeeded > oil) {
-            const maxMargin = Math.floor((oil / (this.cfg.trade.leverage * OIL_FEE_MULTIPLIER)) * 100) / 100;
-            if (maxMargin < this.cfg.risk.min_usdt) {
-                report.trade_skipped_reason = "low-oil-for-fee";
-                return;
+        const fixedMargin = Number(cfg.fixed_margin || 0);
+        const cap = Number(cfg.max_margin_per_order || 0);
+
+        for (const symbol of picks) {
+            if (oil < this.cfg.risk.min_oil) {
+                this.logger.warn(`${EMOJI.warn} Out of OIL for fees — stopping opens`);
+                break;
             }
-            this.logger.warn(`${EMOJI.warn} Auto-shrink margin: ${margin} → ${maxMargin}`);
-            margin = maxMargin;
-        }
 
-        const cap = Number(this.cfg.trade.max_margin_per_order || 0);
-        if (cap > 0 && margin > cap) {
-            this.logger.warn(`${EMOJI.warn} Capping margin ${margin} → ${cap}`);
-            margin = cap;
-        }
+            let margin = fixedMargin > 0 ? fixedMargin : 20;
+            if (cap > 0 && margin > cap) margin = cap;
 
-        const tp = +(btc * (1 + this.cfg.trade.tp_pct / 100)).toFixed(2);
-        const sl = +(btc * (1 - this.cfg.trade.sl_pct / 100)).toFixed(2);
-        const oilFeeFinal = (margin * this.cfg.trade.leverage * OIL_FEE_MULTIPLIER).toFixed(2);
+            let leverage = this._leverageFor(symbol);
 
-        this.logger.info(`${EMOJI.chart} Trade: ${symbol} Long @ ${btc} · margin ${margin} · fee ${oilFeeFinal} OIL · TP ${tp} · SL ${sl}`);
-        const res = await this.executeTradeRpc(email, {
-            symbol, side: "long", leverage: this.cfg.trade.leverage,
-            margin, entry_price: btc, take_profit: tp, stop_loss: sl,
-            margin_mode: this.cfg.trade.margin_mode
-        }, agent);
+            if (this._maxLeverageCache.has(symbol)) {
+                this.logger.info(`${EMOJI.shield} ${symbol}: using cached max leverage ${leverage}x`);
+            } else {
+                this.logger.info(`${EMOJI.dot} ${symbol}: trying configured leverage ${leverage}x`);
+            }
 
-        if (res?.success) {
-            report.trade_opened = true;
-            this.logger.ok(`${EMOJI.party} Trade opened!`);
-        } else {
-            const err = res?.error || res?.__rpc_error || JSON.stringify(res);
-            this.logger.error(`${EMOJI.cross} Trade failed: ${err}`);
-            report.trade_skipped_reason = `trade-failed: ${err}`;
+            let oilFeeNeeded = margin * leverage * OIL_FEE_MULTIPLIER;
+            if (oilFeeNeeded > oil) {
+                const maxMargin = Math.floor((oil / (leverage * OIL_FEE_MULTIPLIER)) * 100) / 100;
+                if (maxMargin < this.cfg.risk.min_usdt) {
+                    this.logger.warn(
+                        `${EMOJI.warn} ${symbol}: not enough OIL for fee ` +
+                        `(need ${oilFeeNeeded.toFixed(2)}, have ${oil.toFixed(2)})`
+                    );
+                    continue;
+                }
+                this.logger.warn(`${EMOJI.warn} ${symbol}: shrink margin ${margin} → ${maxMargin}`);
+                margin = maxMargin;
+                oilFeeNeeded = margin * leverage * OIL_FEE_MULTIPLIER;
+            }
+
+            const price = await this.getPrice(symbol, agent);
+            if (!price) {
+                this.logger.warn(`${EMOJI.warn} ${symbol}: no price available`);
+                continue;
+            }
+
+            const opened = await this._attemptOpen({
+                email, agent, symbol, price, margin, leverage,
+                onOilUsed: (used) => { oil -= used; },
+                report
+            });
+
+            if (opened) continue;
+
+            // Fallback: parse max leverage from error, cache it, retry
+            const lastErr = report.__lastOpenError || "";
+            const maxLev = this._parseMaxLeverageFromError(lastErr);
+
+            if (maxLev && maxLev < leverage) {
+                this._rememberMaxLeverage(symbol, maxLev);
+                leverage = maxLev;
+
+                oilFeeNeeded = margin * leverage * OIL_FEE_MULTIPLIER;
+                if (oilFeeNeeded > oil) {
+                    const maxMargin = Math.floor((oil / (leverage * OIL_FEE_MULTIPLIER)) * 100) / 100;
+                    if (maxMargin < this.cfg.risk.min_usdt) {
+                        this.logger.warn(`${EMOJI.warn} ${symbol}: not enough OIL for retry at ${leverage}x`);
+                        continue;
+                    }
+                    margin = maxMargin;
+                    oilFeeNeeded = margin * leverage * OIL_FEE_MULTIPLIER;
+                }
+
+                this.logger.warn(
+                    `${EMOJI.warn} ${symbol}: platform caps at ${leverage}x — retrying`
+                );
+
+                const retried = await this._attemptOpen({
+                    email, agent, symbol, price, margin, leverage,
+                    onOilUsed: (used) => { oil -= used; },
+                    report
+                });
+
+                if (!retried) {
+                    this.logger.error(`${EMOJI.cross} ${symbol}: retry at ${leverage}x failed`);
+                }
+            }
         }
     }
 
@@ -997,6 +1250,7 @@ class KieDexBot {
             kdx_claimed: false, kdx_claimed_amount: 0,
             tasks_completed: 0, tasks_skipped: 0,
             trade_opened: false, trade_skipped_reason: "",
+            trades_opened: 0,
             kdx_earned: 0, oil_balance: 0, usdt_balance: 0,
             tier: "", errors: [], duration_sec: 0,
             positions_closed: 0, realized_pnl: 0, close_errors: 0,
@@ -1147,7 +1401,7 @@ class KieDexBot {
                     if (r.kdx_claimed) this.report.kdx_claims_ok++;
                     if (r.kdx_claimed_amount) this.report.kdx_total_claimed += r.kdx_claimed_amount;
                     this.report.tasks_completed += r.tasks_completed;
-                    if (r.trade_opened) this.report.trades_opened++;
+                    if (r.trades_opened) this.report.trades_opened += r.trades_opened;
                     if (r.positions_closed) this.report.positions_closed += r.positions_closed;
                     if (r.realized_pnl) this.report.realized_pnl += r.realized_pnl;
                     if (r.close_errors) this.report.close_errors += r.close_errors;
@@ -1159,6 +1413,17 @@ class KieDexBot {
             } catch (e) {
                 this.logger.error(`${EMOJI.cross} Crash: ${e.message}`);
                 this.report.accounts_failed++;
+            }
+
+            const startBal = this.report.per_account
+                .reduce((s, a) => s + (a.usdt_balance || 0) + (a.oil_balance || 0), 0);
+            const lossLimit = startBal * 0.25;
+            if (lossLimit > 0 && this.report.realized_pnl < -lossLimit) {
+                this.logger.critical(
+                    `🛑 Daily loss limit hit (${this.report.realized_pnl.toFixed(2)} USDT > ${lossLimit.toFixed(2)}) — aborting`
+                );
+                this.shutdown = true;
+                break;
             }
 
             const processed = this.report.accounts_ok + this.report.accounts_failed;
@@ -1204,6 +1469,10 @@ class KieDexBot {
 
         this.logger.summary(`🤖 Groq solver: ${this.quizSolver.isEnabled() ? "enabled" : "disabled"}`);
         this.logger.summary(`📈 Trading: ${dailyTrades} cycles/day · ${gapMinutes}min between cycles`);
+        this.logger.summary(`🪙 Pairs: ${this.cfg.trade.symbols === "all" ? "ALL (auto)" : this.cfg.trade.symbols.join(", ")}`);
+        if (this._maxLeverageCache.size) {
+            this.logger.summary(`🛡️  Cached leverage caps: ${this._maxLeverageCache.size} symbols`);
+        }
 
         for (let cycle = 1; cycle <= dailyTrades; cycle++) {
             if (this.shutdown) break;

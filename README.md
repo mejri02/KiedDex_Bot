@@ -8,6 +8,15 @@ Fully automated trading bot for **KieDex** — claims rewards, solves quizzes wi
 
 ---
 
+## Requirements
+
+- **OIL tokens** — Required to pay trading fees. Each trade costs `margin × leverage × 5%` in OIL.
+  - Daily faucet claims (~10 OIL/day) are **not enough** for meaningful volume.
+  - Buy a small amount of ETH (≈ **1 USDT worth**) and swap to OIL via KieDex to get started.
+  - Bot can auto-swap ETH → OIL if configured (`auto_exchange_eth_to_oil: true`).
+
+---
+
 ## Features
 
 - **Multi-account automation** — run dozens of accounts in parallel with proxy rotation
@@ -138,6 +147,14 @@ Get a free Groq API key: https://console.groq.com
 
 Set `groq_api_key` in `config.json`. Bot will auto-solve quizzes with chain-of-thought reasoning.
 
+### 6. Fund with OIL
+
+1. Go to KieDex → Portfolio
+2. Buy a small amount of ETH (≈ **1 USDT worth**)
+3. Use the **ETH → OIL** exchange feature
+
+Bot will auto-manage OIL balance if `auto_exchange_eth_to_oil: true`.
+
 ---
 
 ## Run
@@ -227,7 +244,7 @@ Configure in `config.json` → `webhooks`.
 - **Test dry-run first** — set `trade.dry_run: true`, then flip to `false`
 - **Monitor logs** — check `logs/` for errors
 - **Rotate proxies** — use `sticky_per_account: true` to avoid re-auth loops
-- **Adjust margins** — lower `margin_pct` if hitting oil limits
+- **Adjust margins** — lower `trade.margin_pct` if hitting OIL limits
 - **Set webhooks early** — catch crashes in real-time
 
 ---
