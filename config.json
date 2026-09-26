@@ -1,0 +1,83 @@
+{
+    "ai": {
+        "enabled": true,
+        "provider": "groq",
+        "groq_api_key": "",
+        "model": "openai/gpt-oss-120b",
+        "fallback_model": "openai/gpt-oss-20b",
+        "max_tokens": 512,
+        "temperature": 0.0,
+        "timeout_ms": 20000,
+        "reasoning_effort": "low"
+    },
+    "features": {
+        "faucet": true,
+        "oil": true,
+        "social_tasks": true,
+        "trade": true,
+        "eth_to_oil": true,
+        "usdt_transfer": true,
+        "tier_display": true,
+        "airdrop_stats": true,
+        "season1_check": true,
+        "staking_claim": true,
+        "notifications_mark_read": true,
+        "daily_kdx": true,
+        "quiz": true,
+        "quiz_auto_submit": true,
+        "quiz_use_ai": true,
+        "quiz_log_path": "quiz_log.json"
+    },
+    "trade": {
+        "enabled": true,
+        "symbols": "all",
+        "leverage": 50,
+        "margin_mode": "isolated",
+        "margin_source": "oil",
+        "margin_pct": 100,
+        "fixed_margin": 20,
+        "max_margin_per_order": 40,
+        "tp_pct": 5.0,
+        "sl_pct": 40.0,
+        "max_open_positions": 10,
+        "max_trades_per_cycle": 3,
+        "dry_run": false,
+        "daily_trades": 24,
+        "cycle_gap_minutes": 5,
+        "auto_close_enabled": true,
+        "auto_close_after_hours": 0,
+        "auto_close_on_profit_pct": 20.0,
+        "auto_close_on_loss_pct": 40.0,
+        "close_before_reopen": false,
+        "close_timeout_ms": 25000,
+        "close_reason_tag": "volume_farm",
+        "daily_kdx_use_yesterday": true
+    },
+    "risk": {
+        "min_oil": 20,
+        "min_usdt": 20,
+        "auto_exchange_eth_to_oil": true,
+        "min_oil_trigger_exchange": 40,
+        "min_eth_to_exchange": 0.0005,
+        "auto_transfer_spot_to_futures": true,
+        "min_futures_usdt": 20
+    },
+    "proxy": {
+        "preflight_check": true,
+        "sticky_per_account": true,
+        "rotate_on_http_error": true,
+        "blacklist_after_fails": 3
+    },
+    "webhooks": {
+        "discord_url": "",
+        "telegram_bot_token": "",
+        "telegram_chat_id": "",
+        "notify_on": ["margin_call", "refresh_failed", "cycle_summary", "crash", "close_trade", "quiz_failed"]
+    },
+    "runtime": {
+        "max_retries": 5,
+        "inter_account_delay_min": 3,
+        "inter_account_delay_max": 8,
+        "circuit_breaker_pct": 50
+    }
+}
